@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # base size
-size=512
+size=256
 
 # overwrite previous results and write header
 echo "N,time_seconds" > benchmark_res.csv
 
 # run 5x5 experiments (outer loop name 'run' to avoid reusing the same var)
-for run in {1..10}; do
-    for i in {1..10}; do
+for run in {1..5}; do
+    for i in {1..5}; do
         N=$(( size * i ))
         printf "Running benchmark for N=%d (run %d)\n" "$N" "$run"
 
