@@ -10,36 +10,78 @@
 __constant__ float d_filter[49];
 
 // --------------------------------------------------
-// CUDA kernel
+// CUDA kernel with shared memory and memory coalescing
 // --------------------------------------------------
 __global__ void convolution2D(const unsigned char *input,
                               unsigned char *output,
                               int M, int N)
 {
-    int r = blockIdx.y * blockDim.y + threadIdx.y;
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    // Shared memory tile with halo region for filter
+    extern __shared__ unsigned char s_tile[];
+    
     int radius = N / 2;
-
-    if (r >= M || c >= M) return;
-
-    float sum = 0.0f;
-
-    for (int fr = -radius; fr <= radius; fr++) {
-        for (int fc = -radius; fc <= radius; fc++) {
-            int ir = r + fr;
-            int ic = c + fc;
-            if (ir >= 0 && ir < M && ic >= 0 && ic < M) {
-                float pixel = (float)input[ir * M + ic];
-                float weight = d_filter[(fr + radius) * N + (fc + radius)];
-                sum += pixel * weight;
+    int tile_width = blockDim.x + 2 * radius;
+    int tile_height = blockDim.y + 2 * radius;
+    
+    // Global thread indices
+    int gx = blockIdx.x * blockDim.x + threadIdx.x;
+    int gy = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    // Local thread indices within block
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    // Load tile into shared memory with coalesced access
+    // Each thread loads multiple rows if needed, accessing consecutive columns for coalescing
+    int rows_per_thread = (tile_height + blockDim.y - 1) / blockDim.y;
+    
+    for (int row = 0; row < rows_per_thread; row++) {
+        int local_row = ty * rows_per_thread + row;
+        if (local_row < tile_height) {
+            int global_row = blockIdx.y * blockDim.y + local_row - radius;
+            
+            // Load each column in this row - threads with consecutive tx access consecutive memory
+            for (int local_col = tx; local_col < tile_width; local_col += blockDim.x) {
+                int global_col = blockIdx.x * blockDim.x + local_col - radius;
+                
+                if (global_row >= 0 && global_row < M && global_col >= 0 && global_col < M) {
+                    s_tile[local_row * tile_width + local_col] = input[global_row * M + global_col];
+                } else {
+                    s_tile[local_row * tile_width + local_col] = 0;
+                }
             }
         }
     }
-
-    // clamp
+    
+    // Synchronize to ensure all data is loaded
+    __syncthreads();
+    
+    // Check if this thread computes a valid output pixel
+    if (gx >= M || gy >= M) return;
+    
+    // Compute convolution using shared memory
+    float sum = 0.0f;
+    
+    // Local position in shared memory tile (accounting for halo)
+    int local_r = ty + radius;
+    int local_c = tx + radius;
+    
+    for (int fr = -radius; fr <= radius; fr++) {
+        for (int fc = -radius; fc <= radius; fc++) {
+            int local_ir = local_r + fr;
+            int local_ic = local_c + fc;
+            
+            // Access shared memory (no bounds check needed as halo is loaded)
+            float pixel = (float)s_tile[local_ir * tile_width + local_ic];
+            float weight = d_filter[(fr + radius) * N + (fc + radius)];
+            sum += pixel * weight;
+        }
+    }
+    
+    // Clamp and write output with coalesced access
     if (sum < 0)   sum = 0;
     if (sum > 255) sum = 255;
-    output[r * M + c] = (unsigned char)(sum + 0.5f);
+    output[gy * M + gx] = (unsigned char)(sum + 0.5f);
 }
 
 // --------------------------------------------------
@@ -113,6 +155,12 @@ int main(int argc,char**argv){
 
     dim3 block(16,16);
     dim3 grid((M+block.x-1)/block.x,(M+block.y-1)/block.y);
+    
+    // Calculate shared memory size (tile + halo region)
+    int radius = N / 2;
+    int tile_width = block.x + 2 * radius;
+    int tile_height = block.y + 2 * radius;
+    size_t shared_mem_size = tile_width * tile_height * sizeof(unsigned char);
 
     // Create CUDA events for timing
     cudaEvent_t start, stop;
@@ -122,8 +170,8 @@ int main(int argc,char**argv){
     // Record start
     cudaEventRecord(start);
 
-    // Launch kernel
-    convolution2D<<<grid, block>>>(d_input, d_output, M, N);
+    // Launch kernel with shared memory
+    convolution2D<<<grid, block, shared_mem_size>>>(d_input, d_output, M, N);
 
     // Record stop and synchronize
     cudaEventRecord(stop);
