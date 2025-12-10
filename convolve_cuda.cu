@@ -32,23 +32,28 @@ __global__ void convolution2D(const unsigned char *input,
     int ty = threadIdx.y;
     
     // Load tile into shared memory with coalesced access
-    // Each thread loads multiple rows if needed, accessing consecutive columns for coalescing
-    int rows_per_thread = (tile_height + blockDim.y - 1) / blockDim.y;
+    // Threads load consecutive elements row-by-row for optimal coalescing
+    int threads_per_block = blockDim.x * blockDim.y;
+    int thread_id = ty * blockDim.x + tx;
+    int total_elements = tile_width * tile_height;
+    int elements_per_thread = (total_elements + threads_per_block - 1) / threads_per_block;
     
-    for (int row = 0; row < rows_per_thread; row++) {
-        int local_row = ty * rows_per_thread + row;
-        if (local_row < tile_height) {
-            int global_row = blockIdx.y * blockDim.y + local_row - radius;
+    for (int i = 0; i < elements_per_thread; i++) {
+        int idx = thread_id + i * threads_per_block;
+        if (idx < total_elements) {
+            // Calculate position in tile (row-major order)
+            int local_row = idx / tile_width;
+            int local_col = idx % tile_width;
             
-            // Load each column in this row - threads with consecutive tx access consecutive memory
-            for (int local_col = tx; local_col < tile_width; local_col += blockDim.x) {
-                int global_col = blockIdx.x * blockDim.x + local_col - radius;
-                
-                if (global_row >= 0 && global_row < M && global_col >= 0 && global_col < M) {
-                    s_tile[local_row * tile_width + local_col] = input[global_row * M + global_col];
-                } else {
-                    s_tile[local_row * tile_width + local_col] = 0;
-                }
+            // Calculate global coordinates (accounting for halo)
+            int global_row = blockIdx.y * blockDim.y + local_row - radius;
+            int global_col = blockIdx.x * blockDim.x + local_col - radius;
+            
+            // Load with boundary checking - consecutive threads access consecutive memory
+            if (global_row >= 0 && global_row < M && global_col >= 0 && global_col < M) {
+                s_tile[local_row * tile_width + local_col] = input[global_row * M + global_col];
+            } else {
+                s_tile[local_row * tile_width + local_col] = 0;
             }
         }
     }
